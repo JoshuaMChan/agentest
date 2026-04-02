@@ -19,6 +19,7 @@ from playwright.sync_api import Page, sync_playwright
 
 ARTIFACTS_DIR = Path("artifacts")
 MAX_AGENT_STEPS = 8
+MAX_AGENT_ERRORS = 3
 DOM_SCAN_LIMIT = 200
 
 
@@ -122,12 +123,15 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
         {"action": "wait", "ms": 1800},
         {"action": "done"},
     ]
+    consecutive_errors = 0
+    recent_errors: list[str] = []
 
     for step in range(MAX_AGENT_STEPS):
         _log(f"agent step {step + 1}/{MAX_AGENT_STEPS}")
         page_title = page.title()
         page_url = page.url
         preview = _visible_text_preview(page)
+        error_context = "; ".join(recent_errors[-3:]) if recent_errors else "none"
         prompt = (
             "You are controlling a browser robot.\n"
             "Goal: search keyword on Baidu and reach first result page.\n"
@@ -140,11 +144,13 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
             "Rules:\n"
             "- Use only selectors above unless unavailable.\n"
             "- Prefer type then click.\n"
+            "- If previous attempt failed, adapt selector choice or use wait before retry.\n"
             "- done only when URL indicates search results page.\n\n"
             f"Keyword: {keyword}\n"
             f"Current URL: {page_url}\n"
             f"Current title: {page_title}\n"
             f"Visible text preview: {preview}\n"
+            f"Recent errors: {error_context}\n"
         )
         try:
             response = llm.invoke(
@@ -153,43 +159,58 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
             raw = response.content if isinstance(response.content, str) else str(response.content)
             json_str = re.sub(r"^```json|```$", "", raw.strip(), flags=re.MULTILINE).strip()
             action = json.loads(json_str)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            consecutive_errors += 1
+            recent_errors.append(f"llm_error: {exc}")
             action = fallback_actions[min(step, len(fallback_actions) - 1)]
-            _log("LLM unavailable, using fallback action")
+            _log(f"LLM unavailable, using fallback action (error_count={consecutive_errors}/{MAX_AGENT_ERRORS})")
+            if consecutive_errors >= MAX_AGENT_ERRORS:
+                _log("agent failed 3 times. please check page manually.")
+                raise RuntimeError("Agent failed 3 times. Manual page check required.") from exc
 
         action_name = action.get("action")
         _log(f"action: {action_name}")
-        if action_name == "type":
-            selector = action.get("selector", "#kw")
-            text = action.get("text", keyword)
-            type_selector = _first_visible_selector(
-                page, [selector, "input#kw", "input[name='wd']", "textarea[name='wd']", "input.s_ipt"]
-            )
-            if type_selector:
-                locator = page.locator(type_selector).first
-                locator.click()
-                locator.fill("")
-                locator.type(text, delay=50)
+        try:
+            if action_name == "type":
+                selector = action.get("selector", "#kw")
+                text = action.get("text", keyword)
+                type_selector = _first_visible_selector(
+                    page, [selector, "input#kw", "input[name='wd']", "textarea[name='wd']", "input.s_ipt"]
+                )
+                if type_selector:
+                    locator = page.locator(type_selector).first
+                    locator.click()
+                    locator.fill("")
+                    locator.type(text, delay=50)
+                else:
+                    page.keyboard.type(text, delay=50)
+            elif action_name == "click":
+                selector = action.get("selector", "#su")
+                click_selector = _first_visible_selector(
+                    page, [selector, "input#su", "button#su", "input[type='submit']", "button[type='submit']"]
+                )
+                if click_selector:
+                    page.locator(click_selector).first.click(timeout=5000)
+                else:
+                    page.keyboard.press("Enter")
+            elif action_name == "wait":
+                ms = int(action.get("ms", 800))
+                page.wait_for_timeout(max(300, min(ms, 3000)))
+            elif action_name == "done":
+                if "wd=" in page.url or "baidu.com/s" in page.url:
+                    _log("agent reached result page")
+                    return
+                page.wait_for_timeout(800)
             else:
-                page.keyboard.type(text, delay=50)
-        elif action_name == "click":
-            selector = action.get("selector", "#su")
-            click_selector = _first_visible_selector(
-                page, [selector, "input#su", "button#su", "input[type='submit']", "button[type='submit']"]
-            )
-            if click_selector:
-                page.locator(click_selector).first.click(timeout=5000)
-            else:
-                page.keyboard.press("Enter")
-        elif action_name == "wait":
-            ms = int(action.get("ms", 800))
-            page.wait_for_timeout(max(300, min(ms, 3000)))
-        elif action_name == "done":
-            if "wd=" in page.url or "baidu.com/s" in page.url:
-                _log("agent reached result page")
-                return
-            page.wait_for_timeout(800)
-        else:
+                page.wait_for_timeout(800)
+            consecutive_errors = 0
+        except Exception as exc:  # noqa: BLE001
+            consecutive_errors += 1
+            recent_errors.append(f"action_error: {action_name}: {exc}")
+            _log(f"action execution failed (error_count={consecutive_errors}/{MAX_AGENT_ERRORS}): {exc}")
+            if consecutive_errors >= MAX_AGENT_ERRORS:
+                _log("agent failed 3 times. please check page manually.")
+                raise RuntimeError("Agent failed 3 times. Manual page check required.") from exc
             page.wait_for_timeout(800)
 
     type_selector = _first_visible_selector(page, ["input#kw", "input[name='wd']", "textarea[name='wd']", "input.s_ipt"])
