@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,28 @@ DOM_SCAN_LIMIT = 200
 
 def _log(message: str) -> None:
     print(f"[run] {message}", flush=True)
+
+
+def _safe_log_text(text: str) -> str:
+    # Strip control/private-use glyphs that often render as mojibake in terminal logs.
+    out: list[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if cp in (0x0A, 0x0D, 0x09):
+            out.append(ch)
+            continue
+        category = unicodedata.category(ch)
+        if category.startswith("C"):
+            continue
+        if 0xE000 <= cp <= 0xF8FF:
+            continue
+        if 0xF0000 <= cp <= 0xFFFFD:
+            continue
+        if 0x100000 <= cp <= 0x10FFFD:
+            continue
+        out.append(ch)
+    cleaned = "".join(out)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
 
 @dataclass
@@ -215,7 +238,7 @@ def _collect_dom_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
     for idx, item in enumerate(candidates):
         text = str(item.get("text", ""))
         matched = keyword_lc in text.lower()
-        _log(f"DOM_SCAN #{idx + 1} matched={matched} text={text}")
+        _log(f"DOM_SCAN #{idx + 1} matched={matched} text={_safe_log_text(text)}")
         if not matched:
             continue
         raw_clip = _clip_to_viewport(
@@ -233,7 +256,7 @@ def _collect_dom_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
         shot_path = artifacts_dir / f"dom_hit_{hit_idx}.png"
         page.screenshot(path=str(shot_path), clip={"x": x, "y": y, "width": w, "height": h})
         hits.append(UiHit(source="dom", text=text, bbox=(x, y, w, h), screenshot_path=str(shot_path)))
-        _log(f"DOM_HIT #{hit_idx} text={text}")
+        _log(f"DOM_HIT #{hit_idx} text={_safe_log_text(text)}")
     if len(candidates) >= DOM_SCAN_LIMIT:
         _log(f"DOM_SCAN stop reason: reached limit={DOM_SCAN_LIMIT}")
     _log(f"DOM_SCAN end: scanned={len(candidates)} hits_saved={len(hits)}")
@@ -272,9 +295,9 @@ def _collect_ocr_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
         shot_path = artifacts_dir / f"ocr_hit_{len(hits) + 1}.png"
         page.screenshot(path=str(shot_path), clip={"x": cx, "y": cy, "width": cw, "height": ch})
         hits.append(UiHit(source="ocr", text=text, bbox=(cx, cy, cw, ch), screenshot_path=str(shot_path)))
-        _log(f"OCR_HIT #{len(hits)} text={text}")
+        _log(f"OCR_HIT #{len(hits)} text={_safe_log_text(text)}")
         if not ocr_hit_logged:
-            _log(f"OCR_TEXT full={full_ocr_text}")
+            _log(f"OCR_TEXT full={_safe_log_text(full_ocr_text)}")
             ocr_hit_logged = True
     _log(f"OCR_SCAN end: words={len(all_ocr_texts)} hits_saved={len(hits)}")
     return hits
