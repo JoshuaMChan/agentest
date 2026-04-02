@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -16,6 +18,10 @@ from playwright.sync_api import Page, sync_playwright
 
 ARTIFACTS_DIR = Path("artifacts")
 MAX_AGENT_STEPS = 8
+
+
+def _log(message: str) -> None:
+    print(f"[run] {message}", flush=True)
 
 
 @dataclass
@@ -74,12 +80,15 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
     last_error: Exception | None = None
     for url in ("https://www.baidu.com", "http://www.baidu.com", "https://m.baidu.com"):
         try:
+            _log(f"opening page: {url}")
             page.goto(url, wait_until="commit", timeout=60000)
             page.wait_for_timeout(1200)
             if "baidu.com" in page.url:
+                _log(f"opened successfully: {page.url}")
                 break
         except Exception as exc:  # noqa: BLE001
             last_error = exc
+            _log(f"open failed, trying next url: {exc}")
     else:
         raise RuntimeError(f"Unable to open Baidu from this network: {last_error}")
 
@@ -91,6 +100,7 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
     ]
 
     for step in range(MAX_AGENT_STEPS):
+        _log(f"agent step {step + 1}/{MAX_AGENT_STEPS}")
         page_title = page.title()
         page_url = page.url
         preview = _visible_text_preview(page)
@@ -121,8 +131,10 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
             action = json.loads(json_str)
         except Exception:  # noqa: BLE001
             action = fallback_actions[min(step, len(fallback_actions) - 1)]
+            _log("LLM unavailable, using fallback action")
 
         action_name = action.get("action")
+        _log(f"action: {action_name}")
         if action_name == "type":
             selector = action.get("selector", "#kw")
             text = action.get("text", keyword)
@@ -150,6 +162,7 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
             page.wait_for_timeout(max(300, min(ms, 3000)))
         elif action_name == "done":
             if "wd=" in page.url or "baidu.com/s" in page.url:
+                _log("agent reached result page")
                 return
             page.wait_for_timeout(800)
         else:
@@ -164,6 +177,7 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
 
 
 def _collect_dom_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiHit]:
+    _log("collecting DOM text hits")
     keyword_lc = keyword.lower()
     viewport = page.viewport_size or {"width": 1366, "height": 768}
     candidates = page.evaluate(
@@ -215,10 +229,12 @@ def _collect_dom_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
         shot_path = artifacts_dir / f"dom_hit_{idx + 1}.png"
         page.screenshot(path=str(shot_path), clip={"x": x, "y": y, "width": w, "height": h})
         hits.append(UiHit(source="dom", text=text, bbox=(x, y, w, h), screenshot_path=str(shot_path)))
+    _log(f"DOM hits saved: {len(hits)}")
     return hits
 
 
 def _collect_ocr_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiHit]:
+    _log("running OCR on page screenshot")
     viewport = page.viewport_size or {"width": 1366, "height": 768}
     full_path = artifacts_dir / "full_page.png"
     page.screenshot(path=str(full_path), full_page=False)
@@ -246,6 +262,7 @@ def _collect_ocr_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
         shot_path = artifacts_dir / f"ocr_hit_{len(hits) + 1}.png"
         page.screenshot(path=str(shot_path), clip={"x": cx, "y": cy, "width": cw, "height": ch})
         hits.append(UiHit(source="ocr", text=text, bbox=(cx, cy, cw, ch), screenshot_path=str(shot_path)))
+    _log(f"OCR hits saved: {len(hits)}")
     return hits
 
 
@@ -263,6 +280,7 @@ def _dedupe_hits(hits: list[UiHit]) -> list[UiHit]:
 
 
 def run_validation() -> None:
+    _log("starting validation")
     load_dotenv()
     keyword = "百度"
     api_key = os.getenv("GEMINI_API_KEY")
@@ -270,6 +288,7 @@ def run_validation() -> None:
         raise RuntimeError("Missing GEMINI_API_KEY. Put it in .env or environment variables.")
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    _log(f"clearing old screenshots in: {ARTIFACTS_DIR}")
     for old_png in ARTIFACTS_DIR.glob("*.png"):
         old_png.unlink(missing_ok=True)
     llm = ChatGoogleGenerativeAI(
@@ -280,6 +299,7 @@ def run_validation() -> None:
     )
 
     with sync_playwright() as p:
+        _log("launching headless chromium")
         browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
         context = browser.new_context(
             viewport={"width": 1366, "height": 768},
@@ -294,14 +314,17 @@ def run_validation() -> None:
 
         _click_search_with_llm(page, llm, keyword)
         page.wait_for_timeout(1500)
+        _log("saving result page screenshot")
         page.screenshot(path=str(ARTIFACTS_DIR / "result_page.png"), full_page=False)
 
         dom_hits = _collect_dom_hits(page, keyword, ARTIFACTS_DIR)
         ocr_hits = _collect_ocr_hits(page, keyword, ARTIFACTS_DIR)
         all_hits = _dedupe_hits(dom_hits + ocr_hits)
+        _log(f"deduped total hits: {len(all_hits)}")
 
         context.close()
         browser.close()
+        _log("browser closed")
 
     print(f"keyword: {keyword}")
     print(f"occurrence_count: {len(all_hits)}")
