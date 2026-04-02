@@ -18,6 +18,7 @@ from playwright.sync_api import Page, sync_playwright
 
 ARTIFACTS_DIR = Path("artifacts")
 MAX_AGENT_STEPS = 8
+DOM_SCAN_LIMIT = 200
 
 
 def _log(message: str) -> None:
@@ -177,43 +178,45 @@ def _click_search_with_llm(page: Page, llm: ChatGoogleGenerativeAI, keyword: str
 
 
 def _collect_dom_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiHit]:
-    _log("collecting DOM text hits")
+    _log("DOM_SCAN start: collecting DOM text hits")
     keyword_lc = keyword.lower()
     viewport = page.viewport_size or {"width": 1366, "height": 768}
-    candidates = page.evaluate(
+    candidates: list[dict[str, Any]] = page.evaluate(
         """
-        (kw) => {
+        (maxItems) => {
           const out = [];
           const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
           while (walker.nextNode()) {
             const el = walker.currentNode;
             const text = (el.innerText || "").trim();
             if (!text) continue;
-            if (!text.toLowerCase().includes(kw.toLowerCase())) continue;
             const st = window.getComputedStyle(el);
             if (st.visibility === "hidden" || st.display === "none") continue;
             const rect = el.getBoundingClientRect();
             if (rect.width < 20 || rect.height < 12) continue;
             if (rect.bottom < 0 || rect.right < 0) continue;
             out.push({
-              text: text.slice(0, 120),
+              text: text,
               x: rect.x,
               y: rect.y,
               width: rect.width,
               height: rect.height
             });
-            if (out.length >= 40) break;
+            if (out.length >= maxItems) break;
           }
           return out;
         }
         """,
-        keyword,
+        DOM_SCAN_LIMIT,
     )
 
     hits: list[UiHit] = []
+    hit_idx = 0
     for idx, item in enumerate(candidates):
         text = str(item.get("text", ""))
-        if keyword_lc not in text.lower():
+        matched = keyword_lc in text.lower()
+        _log(f"DOM_SCAN #{idx + 1} matched={matched} text={text}")
+        if not matched:
             continue
         raw_clip = _clip_to_viewport(
             float(item["x"]) - 6,
@@ -226,15 +229,19 @@ def _collect_dom_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
         if not raw_clip:
             continue
         x, y, w, h = raw_clip
-        shot_path = artifacts_dir / f"dom_hit_{idx + 1}.png"
+        hit_idx += 1
+        shot_path = artifacts_dir / f"dom_hit_{hit_idx}.png"
         page.screenshot(path=str(shot_path), clip={"x": x, "y": y, "width": w, "height": h})
         hits.append(UiHit(source="dom", text=text, bbox=(x, y, w, h), screenshot_path=str(shot_path)))
-    _log(f"DOM hits saved: {len(hits)}")
+        _log(f"DOM_HIT #{hit_idx} text={text}")
+    if len(candidates) >= DOM_SCAN_LIMIT:
+        _log(f"DOM_SCAN stop reason: reached limit={DOM_SCAN_LIMIT}")
+    _log(f"DOM_SCAN end: scanned={len(candidates)} hits_saved={len(hits)}")
     return hits
 
 
 def _collect_ocr_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiHit]:
-    _log("running OCR on page screenshot")
+    _log("OCR_SCAN start: running OCR on page screenshot")
     viewport = page.viewport_size or {"width": 1366, "height": 768}
     full_path = artifacts_dir / "full_page.png"
     page.screenshot(path=str(full_path), full_page=False)
@@ -242,6 +249,9 @@ def _collect_ocr_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
     data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     keyword_lc = keyword.lower()
     hits: list[UiHit] = []
+    all_ocr_texts = [str(word).strip() for word in data.get("text", []) if str(word).strip()]
+    full_ocr_text = " ".join(all_ocr_texts)
+    ocr_hit_logged = False
 
     for i, word in enumerate(data.get("text", [])):
         text = (word or "").strip()
@@ -262,7 +272,11 @@ def _collect_ocr_hits(page: Page, keyword: str, artifacts_dir: Path) -> list[UiH
         shot_path = artifacts_dir / f"ocr_hit_{len(hits) + 1}.png"
         page.screenshot(path=str(shot_path), clip={"x": cx, "y": cy, "width": cw, "height": ch})
         hits.append(UiHit(source="ocr", text=text, bbox=(cx, cy, cw, ch), screenshot_path=str(shot_path)))
-    _log(f"OCR hits saved: {len(hits)}")
+        _log(f"OCR_HIT #{len(hits)} text={text}")
+        if not ocr_hit_logged:
+            _log(f"OCR_TEXT full={full_ocr_text}")
+            ocr_hit_logged = True
+    _log(f"OCR_SCAN end: words={len(all_ocr_texts)} hits_saved={len(hits)}")
     return hits
 
 
